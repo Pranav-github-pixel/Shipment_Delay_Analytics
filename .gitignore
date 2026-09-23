@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments & Runtimes
+.venv/
+venv/
+env/
+jre/
+*.zip
+*.tar.gz
+
+# Backups & Temporary files
+*.bak
+*.tmp
+*.swp
+*~
+
+# Unused large access logs
+dataset/*.bak
+dataset/tokenized_access_logs.csv
