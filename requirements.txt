@@ -1,6 +1,9 @@
-pandas>=2.0.0
-matplotlib>=3.5.0
-seaborn>=0.12.0
-pyspark>=3.3.0
-scikit-learn>=1.2.0
-numpy>=1.23.0
+fastapi
+uvicorn
+pyspark
+pandas
+scikit-learn
+matplotlib
+seaborn
+pydantic
+pyarrow
