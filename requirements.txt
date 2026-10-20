@@ -1,9 +1,11 @@
-fastapi
-uvicorn
-pyspark
-pandas
-scikit-learn
-matplotlib
-seaborn
-pydantic
-pyarrow
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+pyspark==3.5.7
+# PySpark 3.5 Pandas conversion imports distutils, removed from Python 3.12.
+setuptools==84.0.0
+pandas>=2.2,<3
+scikit-learn>=1.5,<1.7
+sqlglot>=26,<27
+joblib>=1.4,<2
+pytest>=8,<9
+httpx>=0.27,<1

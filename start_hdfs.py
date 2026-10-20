@@ -1,33 +1,45 @@
+"""Start the existing Docker HDFS cluster, verify readiness, and upload the dataset."""
 import os
 import subprocess
 import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+
+def run(*args, timeout=600):
+    return subprocess.run(args, cwd=ROOT, check=True, timeout=timeout)
+
 
 def main():
-    print("Starting HDFS cluster via Docker Compose...")
-    try:
-        # Check if docker-compose exists
-        subprocess.run(["docker-compose", "up", "-d"], check=True)
-    except Exception as e:
-        print(f"Error starting docker-compose: {e}")
-        print("Please ensure Docker Desktop is installed and running, and docker-compose is in your PATH.")
-        return
-
-    print("Waiting for HDFS Namenode to become ready on port 9000 (usually takes 20-30 seconds)...")
-    time.sleep(30)
-    
-    print("HDFS cluster is running!")
-    print("Namenode UI: http://localhost:9870")
-    
-    # Check if we need to put the dataset in HDFS
-    dataset_path = "dataset/DataCoSupplyChainDataset.csv"
-    if os.path.exists(dataset_path):
-        print("\nFound dataset locally. You can upload it to HDFS using the following command:")
-        print("docker exec -it namenode bash -c \"hdfs dfs -mkdir -p /user/logistics/project_data\"")
-        # To copy from host to docker container:
-        print("docker cp dataset/DataCoSupplyChainDataset.csv namenode:/tmp/")
-        print("docker exec -it namenode bash -c \"hdfs dfs -put /tmp/DataCoSupplyChainDataset.csv /user/logistics/project_data/\"")
+    run('docker', 'info', '--format', '{{.ServerVersion}}', timeout=30)
+    run('docker', 'compose', 'up', '-d')
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        result = subprocess.run(['docker', 'exec', 'namenode', 'hdfs', 'dfsadmin', '-report'],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and 'Live datanodes (1)' in result.stdout:
+            safe = subprocess.run(['docker', 'exec', 'namenode', 'hdfs', 'dfsadmin', '-safemode', 'get'],
+                                  capture_output=True, text=True, timeout=30)
+            if safe.returncode == 0 and 'OFF' in safe.stdout:
+                break
+        time.sleep(3)
     else:
-        print(f"Notice: local dataset not found at {dataset_path}. If you want to use HDFS, please place it there and upload.")
+        raise RuntimeError('HDFS did not become ready within 120 seconds. Inspect docker compose logs.')
+    source = Path(os.getenv('DATASET_PATH', str(ROOT / 'dataset/DataCoSupplyChainDataset.csv'))).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    target = os.getenv('HDFS_DATASET_PATH', '/user/logistics/project_data/DataCoSupplyChainDataset.csv')
+    parent = target.rsplit('/', 1)[0]
+    run('docker', 'exec', 'namenode', 'hdfs', 'dfs', '-mkdir', '-p', parent)
+    run('docker', 'cp', str(source), 'namenode:/tmp/shipment-dataset.csv')
+    # The host Spark client uses the published localhost DataNode port. This
+    # container-side uploader must instead use the DataNode's Docker-network IP.
+    run('docker', 'exec', 'namenode', 'hdfs', 'dfs', '-Ddfs.client.use.datanode.hostname=false',
+        '-put', '-f', '/tmp/shipment-dataset.csv', target)
+    run('docker', 'exec', 'namenode', 'hdfs', 'dfs', '-ls', target)
+    print('HDFS ready and dataset uploaded. Start the backend with STORAGE_MODE=hdfs.')
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
