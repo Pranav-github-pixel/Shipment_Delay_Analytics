@@ -11,6 +11,7 @@ def test_api_unavailable_and_validation(monkeypatch):
     monkeypatch.setattr(service, 'quality', None)
     monkeypatch.setattr(service, 'job', {'state':'idle','stage':'Ready'})
     assert client.get('/api/status').status_code == 200
+    assert client.get('/api/model/explanations').status_code == 503
     assert client.get('/api/analytics').status_code == 409
     assert client.get('/api/analytics?start=2020-01-01&end=2019-01-01').status_code == 422
     assert client.post('/api/query', json={'query':''}).status_code == 422

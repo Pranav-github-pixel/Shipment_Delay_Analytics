@@ -21,7 +21,7 @@ class QueryResponse(BaseModel):
 class PredictionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     order_date: datetime
-    scheduled_days: float = Field(ge=0, le=365)
+    scheduled_days: int = Field(ge=0, le=7)
     quantity: int = Field(ge=1, le=1000000)
     net_sales: float = Field(ge=0, le=1000000000)
     item_count: int = Field(ge=1, le=100000)
@@ -39,11 +39,116 @@ class PredictionRequest(BaseModel):
         return self
 
 
-class PredictionResponse(BaseModel):
+class ExplanationIdentity(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+    model_name: str
+    model_version: str
+    dataset_fingerprint: str
+
+
+class GlobalImportanceRow(BaseModel):
+    feature: str
+    label: str
+    columns: list[str]
+    importance: float
+    std: float = Field(ge=0)
+
+
+class GlobalExplanation(ExplanationIdentity):
+    method: str
+    metric: str
+    scope: str
+    grouping: str
+    rows: int = Field(ge=2)
+    repeats: int = Field(ge=1)
+    baseline_score: float = Field(ge=0, le=1)
+    limitations: str
+    features: list[GlobalImportanceRow]
+    start: str
+    end: str
+    shap: "ShapGlobal"
+
+
+class ShapGlobalRow(GlobalImportanceRow):
+    signed_mean: float
+
+
+class ShapGlobal(ExplanationIdentity):
+    method: str
+    metric: str
+    output_space: Literal['probability', 'log_odds']
+    scope: str
+    rows: int = Field(ge=1)
+    reference_rows: int = Field(ge=1)
+    base_value: float
+    max_additivity_error: float = Field(ge=0)
+    encoded_feature_names: list[str]
+    variation: str
+    limitations: str
+    features: list[ShapGlobalRow]
+
+
+class LocalImportanceRow(BaseModel):
+    feature: str
+    label: str
+    columns: list[str]
+    observed_values: dict[str, str | float]
+    contribution: float
+
+
+class LocalExplanation(ExplanationIdentity):
+    method: str
+    approximate: bool
+    scope: str
+    interpretation: str
+    limitations: str
+    reference_rows: int = Field(ge=1)
+    features: list[LocalImportanceRow]
+    output_space: Literal['probability', 'log_odds']
+    base_value: float
+    output_probability: float = Field(ge=0, le=1)
+    additivity_error: float = Field(ge=0)
+
+
+class Recommendation(BaseModel):
+    rule_id: str
+    title: str
+    action: str
+    trigger: str
+    feature: str | None
+    shap_value: float | None
+
+
+class PredictionResponse(ExplanationIdentity):
     delay_probability: float = Field(ge=0, le=1)
     predicted_delayed: bool
     threshold: float
     scope: str
+    local_explanation: LocalExplanation
+    recommendations: list[Recommendation]
+
+
+class SummaryRequest(PredictionRequest):
+    expected_model_version: str = Field(min_length=1, max_length=80)
+
+
+class SummaryResponse(ExplanationIdentity):
+    summary: str
+    provider: str
+    assistant_model: str
+    notice: str
+
+
+class NaturalQueryRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    question: str = Field(min_length=5, max_length=2000)
+
+
+class NaturalQueryResponse(QueryResponse):
+    generated_sql: str
+    question: str
+    provider: str
+    assistant_model: str
 
 
 class Overview(BaseModel):
@@ -64,10 +169,50 @@ class AnalysisRow(BaseModel):
     average_delay_days: float
 
 
+class HeatmapCell(BaseModel):
+    region: str
+    shipping_mode: str
+    total_orders: int = Field(ge=1)
+    delayed_orders: int = Field(ge=0)
+    delay_rate: float = Field(ge=0, le=1)
+
+
 class AnalyticsResponse(BaseModel):
     overview: Overview
     views: dict[str, list[AnalysisRow]]
     options: dict[str, list[str]]
+    definition: str
+    heatmap: list[HeatmapCell]
+
+
+class GeographicCountry(BaseModel):
+    country: str
+    code: str
+    source_labels: list[str]
+    longitude: float = Field(ge=-180, le=180)
+    latitude: float = Field(ge=-90, le=90)
+    total_orders: int = Field(ge=1)
+    delayed_orders: int = Field(ge=0)
+    delay_rate: float = Field(ge=0, le=1)
+
+
+class UnmappedCountry(BaseModel):
+    country: str
+    total_orders: int = Field(ge=1)
+    delayed_orders: int = Field(ge=0)
+
+
+class GeographicResponse(BaseModel):
+    total_orders: int = Field(ge=0)
+    delayed_orders: int = Field(ge=0)
+    countries: list[GeographicCountry]
+    unmapped: list[UnmappedCountry]
+    unmapped_orders: int = Field(ge=0)
+    unmapped_delayed_orders: int = Field(ge=0)
+    svg: str
+    dataset_job_id: str | None
+    location_scope: str
+    source: str
     definition: str
 
 

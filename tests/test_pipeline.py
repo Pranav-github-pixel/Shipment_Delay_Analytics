@@ -18,7 +18,14 @@ def test_order_grain_duplicates_missing_and_cancelled(raw_factory, monkeypatch):
     assert result['overview']['total_orders'] == 2
     assert result['overview']['delay_rate'] == .5
     assert sum(r['total_orders'] for r in result['views']['temporal']) == 2
-    empty = service.analytics(region='not a region')['overview']
+    assert sum(c['total_orders'] for c in result['heatmap']) == 2
+    assert sum(c['delayed_orders'] for c in result['heatmap']) == 1
+    assert result['heatmap'][0]['delay_rate'] == .5
+    filtered = service.analytics(shipping_mode='Standard Class')
+    assert sum(c['total_orders'] for c in filtered['heatmap']) == filtered['overview']['total_orders']
+    empty_result = service.analytics(region='not a region')
+    assert empty_result['heatmap'] == []
+    empty = empty_result['overview']
     assert empty['total_orders'] == 0 and empty['delay_rate'] is None
     # Changing filters must not evict the shared order cache or alter the source view.
     assert service.global_spark.catalog.isCached('shipments')

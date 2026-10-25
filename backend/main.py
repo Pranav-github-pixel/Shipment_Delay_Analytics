@@ -2,13 +2,16 @@ import os
 import logging
 from datetime import date
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.models.schemas import (QueryRequest, SaveQueryRequest, QueryResponse, PredictionRequest,
-                                PredictionResponse, AnalyticsResponse, SystemStatus, IngestResponse, ModelReport)
+                                PredictionResponse, AnalyticsResponse, SystemStatus, IngestResponse, ModelReport, GlobalExplanation,
+                                SummaryRequest, SummaryResponse, NaturalQueryRequest, NaturalQueryResponse, GeographicResponse)
 from app.services import spark_service as service
-from app.services.model_service import predict
+from app.services.model_service import predict, PredictionInputError
+from app.services import groq_service
+from app.services.explainability import explanation_for
 from app.services.query_manager import get_all_queries, save_query, delete_query
 
 
@@ -70,13 +73,107 @@ def model():
     return service.status()["model"]
 
 
+@app.get('/api/analytics/map', response_model=GeographicResponse)
+def geographic_map(region: str | None = None, shipping_mode: str | None = None,
+                   start: date | None = None, end: date | None = None):
+    if start and end and start > end:
+        raise HTTPException(422, 'Start date must not be after end date')
+    if service.status()['job']['state'] == 'running':
+        raise HTTPException(409, 'Processing is running; wait for completion')
+    try:
+        return service.geographic_map(region, shipping_mode, start, end)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(503, 'World map unavailable. Check the bundled Natural Earth map asset') from exc
+
+
 @app.post("/api/predict", response_model=PredictionResponse)
 def prediction(req: PredictionRequest):
     with service.state_lock:
         pipeline = service.model
     if pipeline is None:
         raise HTTPException(503, "Model unavailable. Process data and inspect model status")
-    return predict(pipeline, req.model_dump())
+    try:
+        return predict(pipeline, req.model_dump())
+    except PredictionInputError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.get('/api/prediction-options')
+def prediction_options(price_page: int = Query(default=0, ge=0)):
+    if service.status()['job']['state'] == 'running':
+        raise HTTPException(409, 'Processing is running; wait for completion')
+    try:
+        return service.prediction_options(price_page)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get('/api/assistant/status')
+def assistant_status():
+    return groq_service.status()
+
+
+@app.post('/api/predict/summary', response_model=SummaryResponse)
+def prediction_summary(req: SummaryRequest):
+    with service.state_lock:
+        pipeline = service.model
+    if pipeline is None:
+        raise HTTPException(503, 'Model unavailable. Process data first')
+    if pipeline.shipment_metadata_['model_version'] != req.expected_model_version:
+        raise HTTPException(409, 'Model changed. Predict again before requesting a summary')
+    try:
+        result = groq_service.operator_summary(predict(pipeline, req.model_dump(exclude={'expected_model_version'})))
+    except PredictionInputError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except (ValueError, groq_service.AssistantUnavailable) as exc:
+        raise HTTPException(503, str(exc)) from exc
+    with service.state_lock:
+        if service.model is not pipeline:
+            raise HTTPException(409, 'Model changed during summary generation. Predict again')
+    return result
+
+
+@app.post('/api/query/natural', response_model=NaturalQueryResponse)
+def natural_query(req: NaturalQueryRequest):
+    initial = service.status()['job']
+    if initial['state'] == 'running':
+        raise HTTPException(409, 'Processing is running; wait for completion')
+    try:
+        schema = service.query_schema()
+        sql, assistant_model = groq_service.natural_sql(req.question, schema)
+        with service.spark_lock:
+            current = service.status()['job']
+            if current['state'] == 'running' or current.get('id') != initial.get('id'):
+                raise HTTPException(409, 'Dataset changed during SQL generation. Please ask again')
+            result = service.execute_spark_query(sql)
+        return {**result, 'generated_sql': sql, 'question': req.question,
+                'provider': 'Groq', 'assistant_model': assistant_model}
+    except groq_service.AssistantUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/model/explanations", response_model=GlobalExplanation)
+def global_explanations():
+    with service.state_lock:
+        pipeline = service.model
+    if pipeline is None:
+        raise HTTPException(503, "Model explanation unavailable. Process data first")
+    try:
+        return explanation_for(pipeline)
+    except ValueError as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 @app.post("/api/query", response_model=QueryResponse)

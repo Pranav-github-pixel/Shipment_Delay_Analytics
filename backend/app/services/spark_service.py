@@ -7,16 +7,20 @@ from datetime import date, datetime
 from decimal import Decimal
 from threading import RLock, Lock, Thread, Timer
 from uuid import uuid4
+from collections import OrderedDict
 from pyspark.sql import SparkSession, functions as F
 import pyspark
 from app import config
 from app.services.data_pipeline import process
 from app.services.model_service import train_or_load
+from app.services import geography
 
 spark_lock = RLock()
 state_lock = Lock()
 global_spark = None
 global_df_clean = None
+global_geographic_df = None
+geographic_cache = OrderedDict()
 model = None
 quality = None
 model_report = {"state": "unavailable", "message": "Process a dataset to train or load a matching model"}
@@ -78,8 +82,9 @@ def update_job(**values):
 
 
 def run_ingestion_and_processing(force=False):
-    global global_df_clean, model, quality, model_report
+    global global_df_clean, global_geographic_df, model, quality, model_report
     fresh = None
+    fresh_geographic = None
     try:
         with spark_lock:
             update_job(stage="Reading and validating order items")
@@ -87,13 +92,15 @@ def run_ingestion_and_processing(force=False):
             raw = (spark.read.option("header", True).option("encoding", "ISO-8859-1")
                    .option("mode", "FAILFAST").option("multiLine", True).csv(source_path()))
             fresh, report = process(raw)
+            fresh_geographic = geography.prepare_orders(raw, fresh).cache()
             update_job(stage="Evaluating model on a chronological holdout")
             try:
-                new_model, new_model_report = train_or_load(fresh, force)
+                new_model, new_model_report = train_or_load(fresh, force, progress=update_job)
             except Exception as exc:
                 new_model, new_model_report = None, {"state": "unavailable", "message": str(exc)}
             fresh.createOrReplaceTempView("shipments")
             previous = global_df_clean
+            previous_geographic = global_geographic_df
             if previous is not None and not previous.sameSemantics(fresh):
                 previous.unpersist()
             # Replacing a view can invalidate an equivalent cached plan. Materialize
@@ -101,12 +108,18 @@ def run_ingestion_and_processing(force=False):
             fresh.cache().count()
             with state_lock:
                 global_df_clean, quality = fresh, report
+                global_geographic_df = fresh_geographic
                 model, model_report = new_model, new_model_report
+                geographic_cache.clear()
+            if previous_geographic is not None:
+                previous_geographic.unpersist()
             update_job(state="completed", stage="Dataset ready" if new_model else "Dataset ready; model unavailable")
     except Exception as exc:
         logging.exception("Dataset processing failed")
         if fresh is not None:
             fresh.unpersist()
+        if fresh_geographic is not None:
+            fresh_geographic.unpersist()
         if global_df_clean is not None:
             with spark_lock:
                 global_df_clean.createOrReplaceTempView("shipments")
@@ -168,8 +181,38 @@ def analytics(region=None, shipping_mode=None, start=None, end=None):
                 GROUP BY {column} ORDER BY {column}""", args=args))
         options = {c: [r[0] for r in global_df_clean.select(c).distinct().orderBy(c).collect()]
                    for c in ["region", "shipping_mode"]}
-        return {"overview": overview, "views": views, "options": options,
+        heatmap = records(spark.sql(f"""SELECT region, shipping_mode, COUNT(*) AS total_orders,
+            SUM(delayed) AS delayed_orders, AVG(delayed) AS delay_rate
+            FROM shipments {where} GROUP BY region, shipping_mode ORDER BY region, shipping_mode""", args=args))
+        return {"overview": overview, "views": views, "options": options, "heatmap": heatmap,
                 "definition": "One eligible order is one shipment proxy. On time includes early delivery. Canceled shipping is excluded."}
+
+
+def geographic_map(region=None, shipping_mode=None, start=None, end=None):
+    with spark_lock:
+        require_data()
+        if global_geographic_df is None:
+            raise RuntimeError('Destination geography unavailable. Reprocess the dataset to load Order Country metadata')
+        key = (job.get('id'), region, shipping_mode, start, end)
+        if key in geographic_cache:
+            geographic_cache.move_to_end(key)
+            return geographic_cache[key]
+        frame = global_geographic_df
+        if region: frame = frame.filter(F.col('region') == region)
+        if shipping_mode: frame = frame.filter(F.col('shipping_mode') == shipping_mode)
+        if start: frame = frame.filter(F.to_date('order_date') >= F.lit(start))
+        if end: frame = frame.filter(F.to_date('order_date') <= F.lit(end))
+        rows = records(frame.groupBy('destination_country').agg(F.count('*').alias('total_orders'),
+            F.sum('delayed').alias('delayed_orders')).select(F.col('destination_country').alias('country'),
+            'total_orders', 'delayed_orders').orderBy('country'))
+        result = geography.mapped_data(rows)
+        result.update(svg=geography.render_map(result), dataset_job_id=job.get('id'),
+            location_scope='Destination-country aggregates using Natural Earth reference points; not exact delivery coordinates',
+            source='Natural Earth 5.1.2, public domain; https://www.naturalearthdata.com/',
+            definition='One eligible order is a shipment proxy. Bubble area represents delayed count; hover for delay rate and eligible count.')
+        geographic_cache[key] = result
+        if len(geographic_cache) > 8: geographic_cache.popitem(last=False)
+        return result
 
 
 def execute_spark_query(query):
@@ -192,3 +235,34 @@ def execute_spark_query(query):
         finally:
             timer.cancel()
             spark.sparkContext.setLocalProperty("spark.jobGroup.id", None)
+
+
+def query_schema():
+    with spark_lock:
+        require_data()
+        return {'view': 'shipments', 'columns': [{'name': field.name, 'type': field.dataType.simpleString()}
+                for field in global_df_clean.schema.fields],
+                'categories': {c: [r[0] for r in global_df_clean.select(c).distinct().orderBy(c).collect()]
+                               for c in ['market', 'region', 'shipping_mode', 'customer_segment', 'payment_type']}}
+
+
+def prediction_options(price_page=0, page_size=200):
+    with spark_lock:
+        require_data()
+        dimensions = ['market', 'region', 'customer_segment', 'payment_type', 'scheduled_days']
+        options = {c: [serializable(r[0]) for r in global_df_clean.select(c).distinct().orderBy(c).collect()]
+                   for c in dimensions}
+        options['observed_scheduled_days'] = options['scheduled_days']
+        options['scheduled_days'] = list(range(8))
+        options['regions_by_market'] = {}
+        for row in global_df_clean.select('market', 'region').distinct().orderBy('market', 'region').collect():
+            options['regions_by_market'].setdefault(row.market, []).append(row.region)
+        prices = global_df_clean.select('net_sales').distinct()
+        count = prices.count()
+        if price_page * page_size >= count and price_page != 0:
+            raise ValueError('Net sales page is out of range')
+        options['net_sales'] = [serializable(r[0]) for r in prices.orderBy('net_sales').offset(price_page * page_size).limit(page_size).collect()]
+        options.update(price_page=price_page, price_page_size=page_size, price_count=count,
+                       model_version=model_report.get('model_version'),
+                       description='Scheduled days allow 0–7; observed_scheduled_days identifies dataset coverage. Other options are observed dataset values; amounts are paged in ascending order.')
+        return options

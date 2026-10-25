@@ -29,10 +29,10 @@ def raw_factory(spark, tmp_path):
                 'Late_delivery_risk':'1','Delivery Status':'Late delivery','Order Status':'COMPLETE',
                 'Market':'Europe','Order Region':'Western Europe','Shipping Mode':'Standard Class',
                 'Customer Segment':'Consumer','Type':'DEBIT','Order Item Quantity':'1','Sales':'100',
-                'Order Item Total':'90'}
+                'Order Item Total':'90', 'Order Country':'España'}
         path = tmp_path / 'fixture.csv'
         with path.open('w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=list(COLUMNS))
+            writer = csv.DictWriter(f, fieldnames=[*COLUMNS, 'Order Country'])
             writer.writeheader()
             writer.writerows([{**base, **r} for r in overrides])
         return spark.read.option('header', True).csv(str(path))
